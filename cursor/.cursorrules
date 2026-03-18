@@ -1,0 +1,747 @@
+# 🚀 Cursor Rules for Conversational RAG Agent (v2.0 - Streamlit UI)
+# This agent specializes in answering questions over documents with a professional 3-tab interface
+# Supports parallel upload and query operations with hallucination prevention
+
+# 🎨 UI ARCHITECTURE (STREAMLIT - NEW v2.0)
+The application now uses a modern 3-tab Streamlit interface:
+
+Tab 1: 💬 CHAT
+  - Query interface for asking questions about documents
+  - Displays chat history with user and assistant messages
+  - Shows response time and source citations
+  - Checks vector DB (get_vector_db_stats()) to verify documents exist
+  - Error message if no documents: "No documents indexed yet. Upload in Upload Documents tab!"
+
+Tab 2: 📤 UPLOAD DOCUMENTS
+  - File uploader (accepts .pdf only)
+  - Shows selected files with sizes (KB only, NO paths shown)
+  - Settings: chunk_size slider (400-2000), "add_to_existing" checkbox
+  - Progress bar: [████░░░░░░] with status messages
+  - Success message shows: file count, chunks created, ready status
+  - All file operations use temp_uploads/ directory (hidden from user)
+
+Tab 3: ❓ HELP
+  - Quick start guide (5 steps)
+  - How it works explanation
+  - Tips and best practices
+  - FAQ and troubleshooting
+  - Example questions
+
+CRITICAL: Never show file paths to users. Users see "invoice.pdf" not "D:\New Project\uploads\..."
+
+# ⚠️ HALLUCINATION PREVENTION (TOP PRIORITY)
+- Always include answer verification step before returning responses
+- Check if answer is grounded in retrieved documents, not just LLM training data
+- If uncertain, explicitly state "I cannot find this information in the documents"
+- For document queries, ALWAYS cite sources with document name and page/section
+- Never invent details - err on side of insufficient information vs false information
+- Classify queries correctly: Document Q&A vs Conversational chat (this prevents wrong tool usage)
+
+# 🧠 PROMPT DESIGN RULES (HALLUCINATION CONTROL)
+During generation_node, system prompt MUST enforce:
+- "Answer ONLY from the provided documents. Do not use general knowledge."
+- "If information is not in the documents, explicitly say: 'This information is not in the provided documents.'"
+- "Always quote relevant sections when answering from documents."
+
+Prompt structure for generation_node:
+```
+[SYSTEM]:
+You are a document Q&A assistant. Answer questions ONLY from provided documents.
+If not found, say explicitly: "I cannot find this in the documents."
+Never use general knowledge or training data.
+
+[CONTEXT]:
+<retrieved_documents>
+
+[USER QUESTION]:
+{question}
+
+[INSTRUCTIONS]:
+- Quote the document
+- Cite the source
+- Never make up information
+```
+
+LLM Configuration:
+- temperature=0.2 (factual, not creative)
+- max_tokens=500 (prevents rambling)
+- top_p=0.9 (focused responses)
+
+For chat_tool (conversational):
+- temperature=0.7 (can be friendly)
+- Include chat_history in system prompt
+- Use memory for personalization
+
+# 🏗️ ARCHITECTURE (LANGRAPH-BASED + STREAMLIT UI)
+- Use LangGraph StateGraph for all workflow orchestration (not direct function calls)
+- Define clear state transitions: Query → Classification → Retrieval → Verification → Response
+- Implement conditional edges for routing (document vs chat paths)
+- Use TypedDict for state definitions (AgentState with: question, route, answer, sources)
+- Keep pipeline logic in graph/rag_graph.py, tools in tools/ folder
+
+Streamlit Integration Points:
+- dev/rag_chatbot.py: Main UI file with 3 tabs
+- Tab 1 (Chat): Calls rag_graph.invoke() on user input
+- Tab 2 (Upload): Calls ingest_single_document() from upload_handler.py
+- Sidebar: Shows DocumentManager for file listing and deletion
+- Vector DB checked with get_vector_db_stats() (not document_manager.json)
+
+# ⚡ PARALLEL PROCESSING (KEY FEATURE v2.0)
+The system supports true parallel upload and query operations:
+
+Timeline Example:
+  0:00 User uploads PDF → progress bar [████░░░░░░] 25%
+  0:05 User switches to Chat tab (upload continues in background!)
+  0:10 User asks question while upload still processing
+  0:15 Upload completes → Sidebar updates automatically
+  0:20 Chat response received → Ready for next question
+
+Implementation:
+  - Each tab is independent (no blocking between tabs)
+  - Upload uses temp_uploads/ → ingest_single_document() → vector DB
+  - Chat uses rag_graph.invoke() → retrieval → generation
+  - Both operations can run simultaneously without interference
+  - Sidebar automatically refreshes to show new documents
+
+Benefits:
+  - Users don't wait for upload to ask questions about existing docs
+  - Improved UX: "upload while browsing previous answers"
+  - No data conflicts: OS handles file locking automatically
+  - Real-time feedback: Progress bars and status messages
+
+# 🧩 LANGGRAPH NODE DESIGN (CRITICAL)
+- classification_node: Decides route (chat vs rag), returns {"route": "chat"|"rag"}
+- retrieval_node: Performs hybrid search (vector + BM25), returns {"retrieved_docs": list}
+- generation_node: Generates answer using LLM, returns {"answer": str}
+- verification_node: Validates answer grounding in docs, returns {"confidence": float}
+- response_node: Formats final output, returns {"answer": str, "sources": list}
+
+Each node must follow this pattern:
+```python
+def node_name(state: AgentState) -> dict:
+    # Process full state
+    # Return only partial state update (not entire state)
+    return {"field": value}  # Only modified fields
+```
+
+Node Responsibilities:
+- classification_node: Input question → Output route decision
+- retrieval_node: Input question, decide if rag → Output document chunks
+- generation_node: Input question + docs → Output answer text
+- verification_node: Input answer + docs → Output confidence score
+- response_node: Input answer + docs → Output formatted response with sources
+
+# 🧾 STATE SCHEMA (MANDATORY)
+AgentState TypedDict must include ALL these fields:
+
+```python
+class AgentState(TypedDict):
+    question: str              # Original user query
+    route: str                 # "chat" | "rag" (set by classification_node)
+    retrieved_docs: list       # List of Document objects from retrieval
+    answer: str                # Generated answer text
+    sources: list              # List of source citations {"document": str, "page": int}
+    confidence: float          # Verification confidence (0.0-1.0)
+    chat_history: list         # Previous conversation exchanges
+    error: Optional[str]       # Error message if any step fails
+    verification_passed: bool  # True if answer verified against docs
+```
+
+Why this matters:
+- Cursor AI understands your data flow
+- Every node modification must preserve schema
+- New nodes must respect this structure
+- Makes debugging obvious (missing fields = bug)
+
+# 🔍 QUERY CLASSIFICATION (CRITICAL)
+- Implement hybrid classification: keyword priority → regex patterns → LLM fallback
+- Document keywords: "invoice", "pdf", "document", "file", "page", "report", "table", "figure"
+- Chat keywords: "my name", "who am i", "how are you", "about yourself", "your opinion"
+- Use regex for edge cases: r"(what is my|who am|tell me about.*me)" signals CHAT
+- Add debug logging to all classification decisions (log query + decision + confidence)
+
+# 🧠 CONVERSATION MEMORY
+- Always maintain chat_memory.json for user context
+- Load last 5 conversational exchanges when answering chat queries
+- Use memory to personalize responses ("I remember you said...")
+- For identity/personal questions, check memory before routing to LLM
+- Never forget user information once stated (implement memory persistence)
+
+# 📚 RETRIEVAL STRATEGY (HYBRID REQUIRED)
+- Always use dual-search: Vector (semantic) + Keyword (BM25) search
+- Vector search: Retrieve k=5 most similar documents
+- Keyword search: Search for exact phrases/terms, get top 3
+- Combine results and deduplicate by content (avoid repetition)
+- If hybrid returns < 2 results, log warning - user likely needs different docs
+- Never use retriever without BM25 component
+
+# ✅ ANSWER VERIFICATION (MANDATORY)
+- After generation, verify answer against retrieved documents
+- Create verification prompt: "Does this answer appear in these documents? Yes/No with evidence."
+- If verification fails: Return "Not found in documents" instead of hallucinated answer
+- Log verification results for debugging (pass/fail with confidence score)
+- For critical queries (invoice numbers, dates), require 95%+ verification confidence
+
+# ⚠️ FAILURE HANDLING IN GRAPH (PRODUCTION CRITICAL)
+Implement error recovery at each node:
+
+classification_node failures:
+  - If LLM classification fails → default to "rag" (safer guess)
+  - Log classification error with query for debugging
+  - Retry once before defaulting
+
+retrieval_node failures:
+  - If vector search fails → fallback to BM25 keyword only
+  - If both fail → return empty docs list and log warning
+  - response_node will handle gracefully
+
+generation_node failures:
+  - If LLM API timeout → retry once with shorter context
+  - If second attempt fails → return "Service unavailable, please try again"
+  - Log error for monitoring
+
+verification_node failures:
+  - If verification LLM fails → use confidence=0.5 (unknown)
+  - Never skip verification, always make decision
+  - If confidence < 0.3 → override answer with "Cannot verify answer in documents"
+
+Implement error field in state:
+- Every node catches exceptions and sets {"error": str(exception)}
+- response_node checks error field and returns user-friendly message
+- Never expose stack traces to users, log them server-side only
+
+# 🛠️ TOOL ORGANIZATION & ROUTING
+- chat_tool.py: Conversational responses, use conversation history
+- rag_tool.py: Document-based Q&A, include sources
+- Never call both tools for same query (picker makes exclusive choice)
+- Each tool returns: {"answer": str, "sources": list, "confidence": float}
+
+# 🔀 TOOL ROUTING LOGIC (MUST BE ENFORCED)
+After classification_node sets route:
+
+IF route == "rag":
+  → Call rag_tool (document search + generation + verification)
+  → MUST include sources in response
+  → Verification confidence must be > 0.3
+  → Answer must be grounded in retrieved documents
+
+IF route == "chat":
+  → Call chat_tool (use conversation history)
+  → Load last 5 exchanges from chat_memory.json
+  → Use memory to personalize response
+  → No verification step needed (conversational)
+
+CRITICAL: Never override classification decision later
+  → If classification_node says "rag", always use rag_tool
+  → If classification_node says "chat", always use chat_tool
+  → Changing route mid-pipeline creates hallucinations
+
+Debug routing:
+# 📄 PDF INGESTION (v2.0)
+Two pathways for PDF ingestion:
+
+1. STREAMLIT UI PATH (upload_handler.py):
+   - ingest_single_document(file_path, file_name)
+   - Processes one PDF at a time
+   - Returns {"chunks_added": int, "document_name": str}
+   - Can be called from Streamlit Upload tab
+   - No DocumentManager update (optional tracking)
+
+2. COMMAND LINE PATH (pdf_ingest.py):
+   - ingest_documents() function
+   - Batch processes PDFs from data/ directory
+   - For initial setup or scripting
+   - Updates DocumentManager automatically
+
+Both paths:
+- Use PyPDFLoader for document loading (not pdfplumber)
+- Split with RecursiveCharacterTextSplitter: chunk_size=800, overlap=150
+- Store in Chroma with BAAI/bge-small-en-v1.5 embeddings (semantic quality)
+- Add metadata: source document name, page number, chunk index
+- Verify ingestion: log chunk count and token count per document
+- Handle errors gracefully: log failures, continue processing
+
+# 🔐 PATH HIDING (UI/UX REQUIREMENT v2.0)
+CORE PRINCIPLE: Never expose file system paths to end users
+
+What users see:
+  ✅ "invoice.pdf" (filename only)
+  ✅ "245.2 KB" (file size)
+  ✅ "847 chunks" (statistics)
+  ✅ "🔄 Processing documents..." (generic status)
+  ✅ "✅ Complete!" (simple success)
+
+What users NEVER see:
+  ❌ "D:\New Project\uploads\invoice.pdf" (file path)
+  ❌ "D:\New Project\vector_storage\..." (database location)
+  ❌ "C:\Users\Admin\AppData\Temp\..." (temp files)
+  ❌ "/tmp/pdf_xyz123.pdf" (system paths)
+  ❌ "Error at D:\path\to\file.pdf" (error with paths)
+
+Implementation rules:
+  - All file operations happen in backend code (not visible to user)
+  - Streamlit UI shows only: filenames, sizes, counts, generic messages
+  - Error messages must be user-friendly: "PDF upload failed" not "Error at /path/.../file"
+  - Sidebar shows document names only: "📄 invoice.pdf" not full path
+  - Progress bars show status: "[████░░] 50%" not technical details
+  - Success messages show statistics: "847 chunks" not "stored in /vector_storage"
+
+Code enforcement:
+  - Use os.path.join() for backend paths (never hardcode)
+  - Variables like `temp_dir`, `vector_db_path`, `doc_path` stay backend-only
+  - User-visible strings in st.write(), st.success(), st.error() must be path-free
+  - Log technical details to console, not to Streamlit UI
+  - Never use f-strings that include paths in UI output
+
+Example - WRONG:
+```python
+# ❌ DON'T DO THIS - shows path to user
+st.success(f"Saved to D:\New Project\uploads\{filename}")
+```
+
+Example - RIGHT:
+```python
+# ✅ DO THIS - user-friendly, no paths
+st.success(f"✅ {filename} uploaded successfully ({size_kb:.1f} KB)")
+```
+When user uploads PDFs from the Upload Documents tab:
+
+Step-by-step process:
+1. User selects PDF(s) via st.file_uploader()
+2. Files displayed with names and sizes only (NO paths)
+3. User clicks "🚀 Upload Now"
+4. Progress bar starts: [████░░░░░░] 0%
+5. System saves files to temp_uploads/ directory
+6. ingest_single_document() called for each file
+7. PDF loaded → Text extracted → Chunks created → Embeddings generated
+8. Vectors inserted into Chroma vector DB
+9. Progress bar completes [██████████] 100%
+10. Success message: "✅ 3 files, 847 chunks, Ready to query"
+11. User can immediately switch to Chat tab and ask questions
+
+CRITICAL: Vector DB is the source of truth for document count:
+  - Chat tab must check get_vector_db_stats() NOT document_manager.json
+  - Upload increases document_count in vector DB
+  - Queries use this count to validate documents exist
+  - If no docs in vector DB → show error "Upload PDFs first"
+
+Error handling:
+  - If upload fails → show error message to user
+  - If temp file cleanup fails → log warning (not shown to user)
+  - If embedding generation fails → show which file failed
+  - Partial uploads allowed (if 2/3 files succeed, user gets message)
+
+# 💬 CHAT TAB DOCUMENT CHECK (CRITICAL FIX v2.0)
+The Chat tab must validate documents CORRECTLY:
+
+CORRECT (uses vector DB):
+```python
+try:
+    stats = get_vector_db_stats()
+    doc_count = stats.get("document_count", 0)
+except:
+    doc_count = 0
+
+if doc_count == 0:
+    st.warning("Upload documents first!")
+```
+
+WRONG (only checks JSON):
+```python
+# ❌ DO NOT USE - will miss uploaded documents
+dam = DocumentManager(...)
+doc_count = len(dam.get_all_documents())
+```
+
+Why?
+  - Upload process adds docs to vector DB (Chroma)
+  - DocumentManager tracks metadata (optional)
+  - Vector DB is source of truth for retrieval
+  - Checking only JSON misses valid documents
+
+Implementation in rag_chatbot.py:
+  - Line ~160: Chat tab checks get_vector_db_stats()
+  - Line ~195: Before query processing, re-check vector DB count
+  - Both checks must use same method (get_vector_db_stats())
+  - Never mix vector DB check with JSON-only check
+- Use PyPDFLoader for document loading (not pdfplumber)
+- Split with RecursiveCharacterTextSplitter: chunk_size=800, overlap=150
+- Store in Chroma with BAAI/bge-small-en-v1.5 embeddings (semantic quality)
+- Add metadata: source document name, page number, chunk index
+- Verify ingestion: log chunk count and token count per document
+
+# 🔐 SECURITY & SECRETS
+- NEVER commit .env file (use .env.example as template instead)
+- Store API keys in environment variables, never hardcode
+- Use os.getenv() with default fallback for optional config
+- Validate API key exists before starting application
+- Log when using secrets (but never log the secret value itself)
+
+# 🖥️ CROSS-PLATFORM PATHS
+- Always use os.path.join() for file paths (not forward slashes)
+- Use os.path.abspath() for relative path resolution
+- Never assume platform or drive letters (Windows vs Unix)
+- Test paths with Path().exists() before processing
+- Document all path assumptions in comments
+
+# 📊 PERFORMANCE & LOGGING
+- Log latency for each pipeline step (classification, retrieval, generation, verification)
+- Include step timing in responses for debugging: {"step": "retrieval", "time_ms": 234}
+- Log token counts for LLM calls (input + output)
+- Implement error recovery: catch LLM timeouts, API errors, retriever failures
+- Add structured logging with timestamps
+
+# 📡 OBSERVABILITY & METRICS (PRODUCTION ENGINEERING)
+Track these metrics for every query execution:
+
+Classification Metrics:
+  - classification_latency (ms)
+  - classification_confidence (0.0-1.0)
+  - route chosen (chat vs rag)
+
+Retrieval Metrics:
+  - retrieval_latency (ms)
+  - documents_found (count)
+  - vector_search_score (avg similarity)
+  - bm25_search_score (relevance)
+
+Generation Metrics:
+  - generation_latency (ms)
+  - input_tokens (count)
+  - output_tokens (count)
+
+Verification Metrics:
+  - verification_latency (ms)
+  - verification_confidence (0.0-1.0)
+  - verification_passed (bool)
+
+System-Level Metrics:
+  - total_end_to_end_latency (ms)
+  - hallucination_rate (% of answers that fail verification)
+  - retrieval_hit_rate (% of queries that find relevant docs)
+  - tool_selection_accuracy (% of correct route classifications)
+
+Implement observability:
+- Create metrics.py with MetricsCollector class
+- Collect metrics at each node
+- Log metrics after graph completes
+- Periodically aggregate for reporting
+- Store in metrics.json or external monitoring
+
+These metrics impress reviewers: shows production thinking
+
+# 📝 CODE STYLE
+- Use type hints for all functions (Python 3.9+ style)
+- Docstrings for all modules and public functions
+- Error messages must be user-friendly, not stack traces
+- Keep functions <50 lines, break complex logic into steps
+- Use constants for magic numbers (k=5 for retrieval, temp=0.2, etc.)
+
+# 📂 FILE STRUCTURE & IMPORTS (v2.0)
+Project Root Structure:
+```
+d:\New Project\
+├── app/
+│   ├── main.py                    # Entry point
+│   ├── documents.json             # Document metadata (optional)
+│   ├── chat_memory.json           # Chat history
+│   ├── ingest/
+│   │   ├── pdf_ingest.py          # CLI PDF ingestion
+│   │   ├── upload_handler.py      # UI PDF upload handling
+│   ├── config/
+│   │   ├── embeddings.py          # Embedding model setup
+│   │   ├── llm.py                 # LLM configuration (OpenRouter)
+│   ├── graph/
+│   │   ├── rag_graph.py           # LangGraph pipeline (StateGraph)
+│   ├── rag/
+│   │   ├── retriever.py           # Hybrid search (vector + BM25)
+│   │   ├── generator.py           # Answer generation
+│   │   ├── verifier.py            # Verification logic
+│   │   ├── query_rewriter.py      # Query enhancement
+│   │   ├── query_router.py        # Classification
+│   ├── tools/
+│   │   ├── chat_tool.py           # Conversational responses
+│   │   ├── rag_tool.py            # Document Q&A responses
+│   ├── memory/
+│   │   ├── chat_memory.py         # Memory management
+│   ├── document_manager.py        # Metadata tracking
+├── dev/
+│   ├── rag_chatbot.py             # ✨ MAIN STREAMLIT UI (3 tabs)
+│   ├── QUICKSTART.md
+│   ├── SYSTEM_GUIDE.md
+│   ├── PARALLEL_WORKFLOW_GUIDE.md
+│   ├── VISUAL_INTERFACE_GUIDE.md
+├── vector_storage/                # Chroma DB (auto-created)
+├── temp_uploads/                  # Temp files during upload (auto-cleaned)
+├── .env                           # API keys (NEVER commit)
+├── .env.example                   # Template (safe to commit)
+├── setup.py                       # Automated setup
+├── requirements.txt               # Dependencies
+│
+```
+
+Import Organization (dev/rag_chatbot.py):
+```python
+import streamlit as st          # UI framework
+import os, sys, time            # Standard library
+from pathlib import Path        # Path handling
+
+# Add app to path so we can import modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
+
+# Import from app modules
+from graph.rag_graph import rag_graph
+from ingest.upload_handler import (
+    ingest_single_document,
+    get_vector_db_stats,
+    reset_vector_db,
+    delete_document
+)
+from document_manager import DocumentManager
+```
+
+Import Patterns for Other Files:
+- ingest/upload_handler.py: Imports from config.embeddings, config.llm
+- graph/rag_graph.py: Imports tools from tools/, rag from rag/
+- tools/*.py: Imports from graph, rag, config modules
+- Never circular imports (tool → graph → tool = BAD)
+
+Global Constants (define at top of each file):
+```python
+CHUNK_SIZE = 800                  # Characters per chunk
+CHUNK_OVERLAP = 150               # Character overlap between chunks
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+TEMPERATURE_RAG = 0.2             # Factual responses
+TEMPERATURE_CHAT = 0.7            # Conversational responses
+K_RETRIEVAL = 5                   # Top-K documents to retrieve
+```
+
+# 🎯 CRITICAL IMPLEMENTATION DETAILS (v2.0)
+
+Chat Tab Requirements (dev/rag_chatbot.py):
+```python
+# ❌ WRONG: Only checks JSON document manager
+dam = DocumentManager(...)
+if len(dam.get_all_documents()) == 0:
+    st.warning("Upload first!")
+
+# ✅ CORRECT: Checks actual vector DB
+try:
+    stats = get_vector_db_stats()
+    doc_count = stats.get("document_count", 0)
+except:
+    doc_count = 0
+
+if doc_count == 0:
+    st.warning("No documents indexed...")
+```
+
+Why this matters:
+- DocumentManager is optional (for metadata tracking)
+- Vector DB is where actual documents live (Chroma)
+- User uploads go directly to vector DB
+- Missing this check causes: "No documents indexed" error even when docs exist!
+
+Upload Tab Requirements (dev/rag_chatbot.py):
+```python
+# Step 1: Save files to temp location
+temp_dir = os.path.join(os.path.dirname(__file__), "..", "temp_uploads")
+os.makedirs(temp_dir, exist_ok=True)
+
+# Step 2: Process each file
+from ingest.upload_handler import ingest_single_document
+for uf in uploaded_files:
+    fp = os.path.join(temp_dir, uf.name)
+    with open(fp, "wb") as f:
+        f.write(uf.getbuffer())
+    
+    result = ingest_single_document(fp, uf.name)
+    total_chunks += result.get("chunks_added", 0)
+
+# Step 3: Clean up
+import shutil
+shutil.rmtree(temp_dir, ignore_errors=True)
+
+# Step 4: Show success (NO PATHS!)
+st.success(f"✅ {len(uploaded_files)} files, {total_chunks} chunks ready!")
+```
+
+Never in success message:
+- ❌ File paths: "Saved to D:\New Project\uploads\"
+- ❌ DB location: "Stored in vector_storage collection_123"
+- ❌ Temp files: "Processed in C:\Users\...\AppData\Temp\"
+- ✅ Just stats: "✅ 3 files, 847 chunks"
+
+Sidebar Document List:
+```python
+# ✅ CORRECT: Document manager to show indexed files
+doc_manager = DocumentManager(doc_path)
+documents = doc_manager.get_all_documents()
+
+for doc in documents:
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.caption(f"📄 {doc['name']}")          # ✅ Just name
+        st.caption(f"   {doc['chunk_count']} chunks")  # ✅ Just count
+    with col2:
+        if st.button("🗑️", key=f"del_{doc['name']}"):
+            delete_document(doc['name'])
+            doc_manager.delete_document(doc['name'])
+            st.rerun()
+```
+
+Error Message Requirements:
+```python
+# ❌ WRONG: Shows path and technical details
+❌ "Error: [Errno 2] No such file or directory: 'D:\\New Project\\uploads\\file.pdf'"
+
+# ✅ CORRECT: User-friendly, no paths
+✅ "❌ Could not process file.pdf - please verify it's a valid PDF"
+```
+
+Parallel Operations Design:
+- Each tab uses st.session_state independently
+- Upload progress stored in st.session_state (not shared with chat)
+- Chat history stored in st.session_state.chat_history (separate)
+- Sidebar auto-refreshes to show new documents
+- No locking between tabs (OS handles file conflicts)
+- st.rerun() only reruns current session, not all users
+
+# 🧪 TESTING & VALIDATION
+- Test query classification with edge cases (personal questions, ambiguous)
+- Verify retrieval returns relevant documents (spot check source relevance)
+- Test hallucination prevention (ask questions NOT answered in documents)
+- Validate memory persistence (ask about previous exchanges)
+- Benchmark vs baseline: Document accuracy, hallucination rate, response time
+
+# 📚 DOCUMENTATION REQUIRED
+- README.md: Overview, quick start, architecture, examples
+- ARCHITECTURE.md: Component diagrams, state flows, design decisions
+- PROBLEM_SPECIALIZATION.md: Why this problem, why it's #1 priority
+- PERFORMANCE_BENCHMARKS.md: Metrics vs alternatives, comparative advantages
+- Inline comments for non-obvious logic (especially LLM prompts)
+
+# 🚀 DEPLOYMENT CHECKLIST (v2.0)
+- ✅ All secrets removed from codebase
+- ✅ Fresh installation works from requirements.txt
+- ✅ Vector DB initializes on first run
+- ✅ PDFs ingest automatically from Upload tab
+- ✅ No hardcoded paths (uses relative, os.path.join())
+- ✅ Logging shows clear workflow progress
+- ✅ Error messages are helpful to end users (no file paths)
+- ✅ README explains every command needed
+- ✅ Streamlit UI has 3 tabs (Chat, Upload, Help)
+- ✅ Chat tab checks vector DB via get_vector_db_stats()
+- ✅ Upload tab never shows file paths to users
+- ✅ Sidebar shows document names and chunk counts
+- ✅ Parallel operations work (upload + chat simultaneously)
+- ✅ Progress bars show during file processing
+- ✅ Success messages show statistics not locations
+- ✅ All temp files cleaned up after processing
+
+# 🎨 STREAMLIT BEST PRACTICES (v2.0)
+UI/UX Guidelines:
+- Use st.tabs() for multi-page navigation (Chat, Upload, Help)
+- Use st.sidebar for persistent controls and status
+- Use st.columns() for responsive layouts
+- Use st.metric() for statistics display
+- Use st.progress() for long-running operations
+- Use st.file_uploader(type=["pdf"], accept_multiple_files=True) for multi-file upload
+- Use st.spinner() to show thinking/processing states
+- Use st.success(), st.error(), st.warning() for feedback messages
+
+Session State Management:
+```python
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+```
+- Always initialize in session state before using
+- Persist across tab switches and reruns
+- Use for chat history, upload counters, user input state
+
+Caching & Performance:
+- Use @st.cache_resource for one-time initializations (embeddings model, etc.)
+- Use @st.cache_data for expensive computations
+- Avoid caching user uploads or sensitive data
+- Rerun entire page with st.rerun() after state changes
+
+File Uploader Integration:
+- st.file_uploader returns file object with .getbuffer() method
+- Always validate file type before processing
+- Save to temp directory (temp_uploads/) immediately
+- Clean up temp files after ingestion completes
+- Show file size in KB: len(file.getbuffer()) / 1024
+
+Chat Interface:
+- Use st.chat_message() for message display
+- Use st.text_input() for user input (with enter key support)
+- Use st.container() for message grouping
+- Load chat history from st.session_state.chat_history
+- Append messages as: {"role": "user"|"assistant", "content": str, ...metadata}
+
+Error Handling:
+- Catch exceptions and show to user with st.error()
+- Never show stack traces in UI
+- Log errors to console with timestamps
+- Distinguish user errors ("Upload a PDF first") from system errors ("API timeout")
+- Use try/except around LLM calls, vector DB operations, file I/O
+
+Styling & Markdown:
+- Use HTML spans for gradients: linear-gradient(135deg, #667eea 0%, #764ba2 100%)
+- Use emoji generously for visual interest (📚 📤 💬 ❓ 🚀)
+- Use st.markdown(..., unsafe_allow_html=True) for custom styling
+- Keep colors consistent across tabs (purple #667eea, pink #764ba2)
+
+Common Patterns:
+
+Pattern 1 - Metric Cards:
+```python
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("📚 Documents", doc_count)
+with col2:
+    st.metric("🔗 Chunks", chunk_count)
+with col3:
+    st.metric("Status", "🟢 Ready")
+```
+
+Pattern 2 - File Upload with Processing:
+```python
+uploaded_files = st.file_uploader(..., accept_multiple_files=True)
+if uploaded_files:
+    st.info(f"✅ {len(uploaded_files)} file(s) selected")
+    if st.button("🚀 Upload Now"):
+        progress_bar = st.progress(0)
+        status = st.empty()
+        # ... process files ...
+        progress_bar.progress(100)
+```
+
+Pattern 3 - Chat Loop:
+```python
+if not st.session_state.chat_history:
+    st.markdown("Welcome message...")
+else:
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+col1, col2 = st.columns([5, 1])
+with col1:
+    user_input = st.text_input("Your question...", label_visibility="collapsed")
+with col2:
+    if st.button("💬"):
+        # Process and add to history
+        st.rerun()
+```
+
+Pattern 4 - Sidebar Navigation:
+```python
+with st.sidebar:
+    st.markdown("...header...", unsafe_allow_html=True)
+    st.divider()
+    st.subheader("Section 1")
+    # ... controls ...
+    st.divider()
+    st.caption("Footer text")
+```
